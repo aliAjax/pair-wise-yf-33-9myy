@@ -35,7 +35,7 @@ def overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: dateti
 class Repository:
     def __init__(self, path: str | Path):
         self.conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
-        self.conn.row_factory = sqlite3.Row; self.conn.execute("PRAGMA foreign_keys=ON"); self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.row_factory = sqlite3.Row; self.conn.execute("PRAGMA foreign_keys=ON"); self.conn.execute("PRAGMA journal_mode=WAL"); self.conn.execute("PRAGMA busy_timeout=10000")
         self.conn.executescript("""
         CREATE TABLE IF NOT EXISTS satellites(id TEXT PRIMARY KEY, name TEXT NOT NULL, data_rate_mbps REAL NOT NULL, priority INTEGER NOT NULL, storage_capacity_mb REAL NOT NULL, tenant TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active');
         CREATE TABLE IF NOT EXISTS stations(id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', weather TEXT NOT NULL DEFAULT 'clear');
@@ -153,6 +153,15 @@ class SatelliteSchedulingService:
         if exclude_schedule is not None: sql += " AND s.id!=?"; args.append(exclude_schedule)
         return int(conn.execute(sql, args).fetchone()[0])
 
+    def _used_storage(self, conn: sqlite3.Connection, satellite_id: str) -> float:
+        """星上存储被各站已排(scheduled/receiving)和已接收(received)数据共同占住的容量。
+
+        已取消(canceled)和因窗口变化/抢占失效(preempted)的排程不再占用，容量随之放出。
+        """
+        row = conn.execute("""SELECT COALESCE(SUM(r.data_mb),0) FROM schedules s JOIN requests r ON r.id=s.request_id
+                              WHERE s.satellite_id=? AND s.status IN ('scheduled','receiving','received')""", (satellite_id,)).fetchone()
+        return float(row[0])
+
     def schedule_request(self, request_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"operator", "commander"}: raise ApiError(403, "schedule_forbidden", "只有排程员可以安排接收")
         window_id, antenna_id = body.get("window_id"), str(body.get("antenna_id", "")).strip()
@@ -186,6 +195,10 @@ class SatelliteSchedulingService:
             used = self._used_quota(conn, request["tenant"], station["id"], start.date().isoformat())
             duration = int((end - start).total_seconds())
             if quota and used + duration > quota["daily_seconds"]: raise ApiError(409, "tenant_quota_exceeded", "租户当日地面站配额不足", {"used_seconds": used, "requested_seconds": duration, "limit": quota["daily_seconds"]})
+            used_storage = self._used_storage(conn, request["satellite_id"])
+            available_storage = float(satellite["storage_capacity_mb"]) - used_storage
+            if float(request["data_mb"]) > available_storage:
+                raise ApiError(409, "insufficient_storage", "星上存储余量不足，无法排程", {"used_mb": used_storage, "available_mb": available_storage, "required_mb": float(request["data_mb"]), "capacity_mb": float(satellite["storage_capacity_mb"])})
             cur = conn.execute("""INSERT INTO schedules(request_id,window_id,station_id,antenna_id,satellite_id,starts_at,ends_at,rate_mbps,created_by,created_at,updated_at)
                                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                                (request_id, window_id, station["id"], antenna_id, request["satellite_id"], iso(start), iso(end), float(rate), actor, iso(), iso()))
@@ -198,6 +211,12 @@ class SatelliteSchedulingService:
         row = self.repo.conn.execute("""SELECT s.*,r.tenant,r.data_mb,r.priority request_priority,r.deadline FROM schedules s JOIN requests r ON r.id=s.request_id WHERE s.id=?""", (schedule_id,)).fetchone()
         if not row: raise ApiError(404, "schedule_not_found", "排程不存在")
         return dict(row)
+
+    def storage(self, satellite_id: str) -> dict[str, Any]:
+        row = self.repo.conn.execute("SELECT storage_capacity_mb FROM satellites WHERE id=?", (satellite_id,)).fetchone()
+        if not row: raise ApiError(404, "satellite_not_found", "卫星不存在")
+        capacity = float(row["storage_capacity_mb"]); used = self._used_storage(self.repo.conn, satellite_id)
+        return {"satellite_id": satellite_id, "storage_capacity_mb": capacity, "used_mb": used, "available_mb": capacity - used}
 
     def transition(self, schedule_id: int, actor: str, role: str, tenant: str, target: str, body: dict[str, Any]) -> dict[str, Any]:
         with self.repo.tx() as conn:
@@ -316,6 +335,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state": return 200, self.service.state(role, tenant)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "schedules"] and parts[2].isdigit(): return 200, self.service.get_schedule(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["api", "satellites"] and parts[3] == "storage": return 200, self.service.storage(parts[2])
         raise ApiError(404, "not_found", "接口不存在")
     def post_api(self, path: str) -> tuple[int, Any]:
         actor, role, tenant = self.service.identity(self.headers); body = self.body(); parts = [p for p in path.split("/") if p]
