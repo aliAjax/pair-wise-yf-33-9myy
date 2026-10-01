@@ -19,7 +19,16 @@ python3 app.py --db satellite_scheduling.db
 - `POST /api/requests/{id}/schedule`、`/reschedule`：排程或重排被抢占请求。
 - `POST /api/schedules/{id}/start`、`/complete`、`/cancel`、`/preempt`：接收状态和紧急抢占。
 - `POST /api/visibility-windows/{id}/change`：窗口变化并返回受影响排程；已接收数据保留。
+- `GET /api/satellites/{id}/storage`：查询星上存储容量、已占用、可用余量及按状态/站的占用明细。
 - `GET /api/state`、`GET /api/schedules/{id}`：权限化状态查询。
+
+## 星上存储余量规则
+
+- 容量取自卫星的 `storage_capacity_mb`；占用 = 该星在**所有地面站**状态为 `scheduled`、`receiving`、`received` 的数据量之和（值班员可通过 storage 接口看到余量，避免同容量重复排给两段）。
+- 排新任务时在同一事务内先读余量再插入：`data_mb > available_mb` 即拒绝（409 `storage_capacity_exceeded`），details 返回 `capacity_mb / used_mb / available_mb / breakdown_mb / required_mb`。
+- 取消、紧急抢占、窗口变化导致未接收排程失效时，其数据量立即释放；`received` 数据在卸载前持续占用，窗口变化时只标记 `preserve_received_data`，不释放。
+- 两个调度员并发提交同一颗星时，写事务使用 `BEGIN IMMEDIATE` + WAL 单写者，后到者阻塞后整体重试并按最新余量重新判定，不能超发。
+- 余量占用由 `schedules` 行派生，与排程插入/状态更新在同一事务：任何写入失败都会一起回滚，不会出现“余量扣了但排程没建成”。
 
 ## 测试
 
